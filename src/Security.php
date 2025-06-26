@@ -184,22 +184,35 @@ class Security
     }
 
     /**
-     * 清理文件名
+     * 清理文件名（现在主要用于验证，实际文件名由WebDAV客户端生成）
      */
     public function sanitizeFileName($fileName)
     {
-        // 移除路径分隔符和特殊字符
+        // 移除路径分隔符和危险字符
         $fileName = basename($fileName);
-        $fileName = preg_replace('/[^a-zA-Z0-9\._\-\x{4e00}-\x{9fa5}]/u', '_', $fileName);
-        
-        // 限制文件名长度
-        if (strlen($fileName) > 255) {
+
+        // 移除控制字符和一些特殊字符，但保留更多合法字符
+        $fileName = preg_replace('/[\x00-\x1f\x7f<>:"|?*\\\\\/]/', '_', $fileName);
+
+        // 移除连续的点号（防止目录遍历）
+        $fileName = preg_replace('/\.{2,}/', '.', $fileName);
+
+        // 确保不以点号开头或结尾
+        $fileName = trim($fileName, '.');
+
+        // 如果文件名为空，给一个默认名称
+        if (empty($fileName)) {
+            $fileName = 'unnamed_file';
+        }
+
+        // 限制文件名长度（为WebDAV路径留出空间）
+        if (strlen($fileName) > 200) {
             $pathInfo = pathinfo($fileName);
-            $name = substr($pathInfo['filename'], 0, 200);
+            $name = substr($pathInfo['filename'], 0, 150);
             $extension = isset($pathInfo['extension']) ? '.' . $pathInfo['extension'] : '';
             $fileName = $name . $extension;
         }
-        
+
         return $fileName;
     }
 

@@ -46,7 +46,12 @@ class Config
             'rate_limit_time_window' => (int)($_ENV['RATE_LIMIT_TIME_WINDOW'] ?? 3600),
             'log_enabled' => filter_var($_ENV['LOG_ENABLED'] ?? true, FILTER_VALIDATE_BOOLEAN),
             'log_level' => $_ENV['LOG_LEVEL'] ?? 'info',
-            'log_file' => $_ENV['LOG_FILE'] ?? 'logs/app.log'
+            'log_file' => $_ENV['LOG_FILE'] ?? 'logs/app.log',
+            // CDN和上传优化配置
+            'enable_direct_upload' => filter_var($_ENV['ENABLE_DIRECT_UPLOAD'] ?? false, FILTER_VALIDATE_BOOLEAN),
+            'cdn_optimization' => filter_var($_ENV['CDN_OPTIMIZATION'] ?? true, FILTER_VALIDATE_BOOLEAN),
+            'upload_chunk_size' => $this->parseSize($_ENV['UPLOAD_CHUNK_SIZE'] ?? '1M'),
+            'max_upload_retries' => (int)($_ENV['MAX_UPLOAD_RETRIES'] ?? 3)
         ];
     }
 

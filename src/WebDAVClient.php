@@ -35,7 +35,10 @@ class WebDAVClient
         // 生成唯一文件名避免冲突
         $remoteFileName = $this->generateUniqueFileName($remoteFileName);
         $remotePath = $this->basePath ? $this->basePath . '/' . $remoteFileName : $remoteFileName;
-        $fullUrl = $this->url . '/' . ltrim($remotePath, '/');
+
+        // 正确处理URL编码，避免特殊字符问题
+        $encodedPath = $this->encodeWebDAVPath($remotePath);
+        $fullUrl = $this->url . '/' . ltrim($encodedPath, '/');
 
         // 确保目录存在
         $this->createDirectoryIfNotExists(dirname($remotePath));
@@ -46,33 +49,53 @@ class WebDAVClient
             throw new \Exception("无法读取文件: {$localFilePath}");
         }
 
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $fullUrl,
-            CURLOPT_USERPWD => $this->username . ':' . $this->password,
-            CURLOPT_CUSTOMREQUEST => 'PUT',
-            CURLOPT_POSTFIELDS => $fileContent,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => $this->timeout,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/octet-stream',
-                'Content-Length: ' . strlen($fileContent)
-            ]
-        ]);
+        // 尝试上传，带重试机制
+        $maxRetries = 3;
+        $retryCount = 0;
+        $lastError = '';
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
-        curl_close($ch);
+        while ($retryCount < $maxRetries) {
+            $ch = curl_init();
+            curl_setopt_array($ch, [
+                CURLOPT_URL => $fullUrl,
+                CURLOPT_USERPWD => $this->username . ':' . $this->password,
+                CURLOPT_CUSTOMREQUEST => 'PUT',
+                CURLOPT_POSTFIELDS => $fileContent,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => $this->timeout,
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_MAXREDIRS => 3,
+                CURLOPT_HTTPHEADER => [
+                    'Content-Type: application/octet-stream',
+                    'Content-Length: ' . strlen($fileContent),
+                    'User-Agent: PHP-WebDAV-Client/1.0'
+                ]
+            ]);
 
-        if ($error) {
-            throw new \Exception("cURL错误: {$error}");
+            $response = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_error($ch);
+            curl_close($ch);
+
+            if (!$error && $httpCode >= 200 && $httpCode < 300) {
+                // 上传成功
+                break;
+            }
+
+            // 记录错误信息
+            $lastError = $error ? "cURL错误: {$error}" : "HTTP状态码: {$httpCode}, 响应: " . substr($response, 0, 200);
+            $retryCount++;
+
+            // 如果不是最后一次重试，等待一下再重试
+            if ($retryCount < $maxRetries) {
+                usleep(500000); // 等待0.5秒
+            }
         }
 
-        if ($httpCode < 200 || $httpCode >= 300) {
-            throw new \Exception("上传失败，HTTP状态码: {$httpCode}, 响应: {$response}");
+        // 如果所有重试都失败了
+        if ($retryCount >= $maxRetries) {
+            throw new \Exception("上传失败，已重试{$maxRetries}次。最后错误: {$lastError}");
         }
         return [
             'success' => true,
@@ -88,7 +111,8 @@ class WebDAVClient
      */
     public function fileExists($remotePath)
     {
-        $fullUrl = $this->url . '/' . ltrim($remotePath, '/');
+        $encodedPath = $this->encodeWebDAVPath($remotePath);
+        $fullUrl = $this->url . '/' . ltrim($encodedPath, '/');
         
         $ch = curl_init();
         curl_setopt_array($ch, [
@@ -119,7 +143,8 @@ class WebDAVClient
             return true;
         }
 
-        $fullUrl = $this->url . '/' . ltrim($dirPath, '/');
+        $encodedPath = $this->encodeWebDAVPath($dirPath);
+        $fullUrl = $this->url . '/' . ltrim($encodedPath, '/');
         
         $ch = curl_init();
         curl_setopt_array($ch, [
@@ -147,14 +172,37 @@ class WebDAVClient
     private function generateUniqueFileName($originalName)
     {
         $pathInfo = pathinfo($originalName);
-        $name = $pathInfo['filename'];
-        $extension = isset($pathInfo['extension']) ? '.' . $pathInfo['extension'] : '';
-        
-        // 添加时间戳和随机字符串
+        $extension = isset($pathInfo['extension']) ? '.' . strtolower($pathInfo['extension']) : '';
+
+        // 使用时间戳和随机字符串生成安全的文件名
         $timestamp = date('YmdHis');
-        $random = substr(md5(uniqid()), 0, 6);
-        
-        return $name . '_' . $timestamp . '_' . $random . $extension;
+        $random = substr(md5(uniqid(mt_rand(), true)), 0, 8);
+        $microtime = substr(microtime(true) * 10000, -4); // 添加微秒精度
+
+        // 生成完全安全的文件名，避免特殊字符问题
+        $safeFileName = $timestamp . '_' . $microtime . '_' . $random . $extension;
+
+        // 确保文件名长度不超过100字符（大多数文件系统的安全长度）
+        if (strlen($safeFileName) > 100) {
+            $safeFileName = $timestamp . '_' . $random . $extension;
+        }
+
+        return $safeFileName;
+    }
+
+    /**
+     * 正确编码WebDAV路径
+     */
+    private function encodeWebDAVPath($path)
+    {
+        // 分割路径并分别编码每个部分
+        $parts = explode('/', $path);
+        $encodedParts = array_map(function($part) {
+            // 使用rawurlencode而不是urlencode，符合RFC 3986标准
+            return rawurlencode($part);
+        }, $parts);
+
+        return implode('/', $encodedParts);
     }
 
     /**
@@ -162,7 +210,8 @@ class WebDAVClient
      */
     public function deleteFile($remotePath)
     {
-        $fullUrl = $this->url . '/' . ltrim($remotePath, '/');
+        $encodedPath = $this->encodeWebDAVPath($remotePath);
+        $fullUrl = $this->url . '/' . ltrim($encodedPath, '/');
         
         $ch = curl_init();
         curl_setopt_array($ch, [
@@ -188,8 +237,9 @@ class WebDAVClient
      */
     public function downloadFile($remotePath)
     {
-        // 构建完整的URL，确保路径正确
-        $fullPath = '/' . ltrim($remotePath, '/');
+        // 构建完整的URL，确保路径正确并进行编码
+        $encodedPath = $this->encodeWebDAVPath($remotePath);
+        $fullPath = '/' . ltrim($encodedPath, '/');
         $url = $this->url . $fullPath;
 
         $ch = curl_init();
