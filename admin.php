@@ -1,9 +1,44 @@
 <?php
+// 检测环境并设置适当的session配置
+$isXREA = (strpos($_SERVER['SERVER_SOFTWARE'] ?? '', 'Apache') !== false &&
+           strpos($_SERVER['HTTP_HOST'] ?? '', '.xrea.') !== false) ||
+          (isset($_SERVER['DOCUMENT_ROOT']) && strpos($_SERVER['DOCUMENT_ROOT'], '/virtual/') !== false);
+
+if ($isXREA) {
+    // XREA环境专用session配置
+    ini_set('session.cookie_httponly', 1);
+    ini_set('session.use_strict_mode', 1);
+    ini_set('session.cookie_samesite', 'Lax');
+    ini_set('session.gc_maxlifetime', 3600);
+
+    // 尝试设置session保存路径
+    $sessionPath = sys_get_temp_dir();
+    if (is_writable($sessionPath)) {
+        session_save_path($sessionPath);
+    }
+}
+
 session_start();
 require_once 'vendor/autoload.php';
 
 use Filebed\Config;
 use Filebed\FileUploader;
+
+// 重新加载环境变量
+if (file_exists('.env')) {
+    $envContent = file_get_contents('.env');
+    $lines = explode("\n", $envContent);
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if (empty($line) || strpos($line, '#') === 0) {
+            continue;
+        }
+        if (strpos($line, '=') !== false) {
+            list($key, $value) = explode('=', $line, 2);
+            $_ENV[trim($key)] = trim($value);
+        }
+    }
+}
 
 $config = Config::getInstance();
 $uploader = new FileUploader();
@@ -12,13 +47,61 @@ $uploader = new FileUploader();
 $adminPassword = $_ENV['ADMIN_PASSWORD'] ?? 'admin123';
 $isAuthenticated = false;
 
+// 检查POST登录
 if (isset($_POST['password'])) {
     if ($_POST['password'] === $adminPassword) {
         $_SESSION['admin_authenticated'] = true;
+        $_SESSION['login_time'] = time();
         $isAuthenticated = true;
+
+        // 对于XREA环境，强制写入session
+        if ($isXREA) {
+            session_write_close();
+            session_start();
+        }
     }
-} elseif (isset($_SESSION['admin_authenticated']) && $_SESSION['admin_authenticated']) {
-    $isAuthenticated = true;
+}
+
+// 检查session认证
+if (isset($_SESSION['admin_authenticated']) && $_SESSION['admin_authenticated']) {
+    // 检查session是否过期（1小时）
+    if (isset($_SESSION['login_time']) && (time() - $_SESSION['login_time']) < 3600) {
+        $isAuthenticated = true;
+    } else {
+        // session过期，清除
+        unset($_SESSION['admin_authenticated']);
+        unset($_SESSION['login_time']);
+    }
+}
+
+// 增强的AJAX认证检查函数
+function checkAjaxAuth($isAuthenticated, $isXREA) {
+    // 多重认证检查机制
+    $ajaxAuth = false;
+
+    // 方法1：检查当前认证状态
+    if ($isAuthenticated) {
+        $ajaxAuth = true;
+    }
+
+    // 方法2：重新检查session（特别针对XREA环境）
+    if (!$ajaxAuth && isset($_SESSION['admin_authenticated']) && $_SESSION['admin_authenticated']) {
+        if (isset($_SESSION['login_time']) && (time() - $_SESSION['login_time']) < 3600) {
+            $ajaxAuth = true;
+        }
+    }
+
+    // 方法3：对于XREA环境，尝试重新验证session
+    if (!$ajaxAuth && $isXREA && isset($_COOKIE[session_name()])) {
+        session_write_close();
+        session_start();
+        if (isset($_SESSION['admin_authenticated']) && $_SESSION['admin_authenticated'] &&
+            isset($_SESSION['login_time']) && (time() - $_SESSION['login_time']) < 3600) {
+            $ajaxAuth = true;
+        }
+    }
+
+    return $ajaxAuth;
 }
 
 if (!$isAuthenticated) {
@@ -62,9 +145,21 @@ if (!$isAuthenticated) {
 if (isset($_GET['action'])) {
     header('Content-Type: application/json');
 
-    // 检查认证状态
-    if (!$isAuthenticated) {
-        echo json_encode(['success' => false, 'error' => '未认证']);
+    // 使用增强的认证检查
+    $ajaxAuth = checkAjaxAuth($isAuthenticated, $isXREA);
+
+    if (!$ajaxAuth) {
+        echo json_encode([
+            'success' => false,
+            'error' => '未认证',
+            'debug' => $isXREA ? [
+                'session_id' => session_id(),
+                'has_session' => isset($_SESSION['admin_authenticated']),
+                'login_time' => $_SESSION['login_time'] ?? null,
+                'current_time' => time(),
+                'environment' => 'XREA'
+            ] : null
+        ]);
         exit;
     }
 
@@ -139,7 +234,15 @@ if (isset($_GET['action'])) {
 
         case 'add_webdav':
             try {
-                $data = json_decode(file_get_contents('php://input'), true);
+                // 获取JSON数据，兼容XREA环境
+                $input = file_get_contents('php://input');
+                $data = json_decode($input, true);
+
+                // 如果JSON解析失败，尝试从POST获取（XREA环境备用方案）
+                if (!$data) {
+                    $data = $_POST;
+                }
+
                 if (!$data || !isset($data['alias']) || !isset($data['name']) || !isset($data['url']) || !isset($data['username']) || !isset($data['password'])) {
                     throw new Exception('缺少必要参数');
                 }
@@ -148,19 +251,38 @@ if (isset($_GET['action'])) {
                 $envContent = file_exists($envFile) ? file_get_contents($envFile) : '';
 
                 $alias = strtoupper($data['alias']);
+                $basePath = $data['base_path'] ?? '/';
+
                 $newConfig = "\n# WebDAV配置 - {$data['name']}\n";
                 $newConfig .= "WEBDAV_{$alias}_NAME=" . $data['name'] . "\n";
                 $newConfig .= "WEBDAV_{$alias}_URL=" . $data['url'] . "\n";
                 $newConfig .= "WEBDAV_{$alias}_USERNAME=" . $data['username'] . "\n";
                 $newConfig .= "WEBDAV_{$alias}_PASSWORD=" . $data['password'] . "\n";
+                $newConfig .= "WEBDAV_{$alias}_BASE_PATH=" . $basePath . "\n";
 
                 $envContent .= $newConfig;
-                file_put_contents($envFile, $envContent);
+
+                if (file_put_contents($envFile, $envContent) === false) {
+                    throw new Exception('无法写入配置文件');
+                }
 
                 echo json_encode(['success' => true, 'message' => 'WebDAV配置添加成功']);
             } catch (Exception $e) {
                 echo json_encode(['success' => false, 'error' => $e->getMessage()]);
             }
+            exit;
+
+        case 'test_auth':
+            echo json_encode([
+                'success' => true,
+                'message' => '认证成功',
+                'debug' => [
+                    'session_id' => session_id(),
+                    'session_data' => $_SESSION,
+                    'environment' => $isXREA ? 'XREA' : 'Standard',
+                    'auth_method' => $ajaxAuth ? 'session' : 'unknown'
+                ]
+            ]);
             exit;
 
         case 'delete_webdav':
@@ -184,6 +306,7 @@ if (isset($_GET['action'])) {
                     "/^WEBDAV_{$aliasUpper}_URL=.*$/m",
                     "/^WEBDAV_{$aliasUpper}_USERNAME=.*$/m",
                     "/^WEBDAV_{$aliasUpper}_PASSWORD=.*$/m",
+                    "/^WEBDAV_{$aliasUpper}_BASE_PATH=.*$/m",
                     "/^# WebDAV配置 - .*$/m"
                 ];
 
@@ -295,9 +418,16 @@ if (isset($_GET['action'])) {
                 <div class="card">
                     <div class="card-header d-flex justify-content-between align-items-center">
                         <h5><i class="bi bi-server"></i> WebDAV存储管理</h5>
-                        <button class="btn btn-sm btn-success" data-bs-toggle="modal" data-bs-target="#addWebdavModal">
-                            <i class="bi bi-plus"></i> 添加WebDAV
-                        </button>
+                        <div>
+                            <?php if ($isXREA): ?>
+                            <button class="btn btn-sm btn-info me-2" onclick="testAuth()">
+                                <i class="bi bi-shield-check"></i> 测试认证
+                            </button>
+                            <?php endif; ?>
+                            <button class="btn btn-sm btn-success" data-bs-toggle="modal" data-bs-target="#addWebdavModal">
+                                <i class="bi bi-plus"></i> 添加WebDAV
+                            </button>
+                        </div>
                     </div>
                     <div class="card-body">
                         <?php
@@ -314,7 +444,8 @@ if (isset($_GET['action'])) {
                                                     <div>
                                                         <h6><?= htmlspecialchars($webdavConfig['name']) ?></h6>
                                                         <p class="text-muted small mb-1"><?= htmlspecialchars($webdavConfig['url']) ?></p>
-                                                        <p class="text-muted small">用户: <?= htmlspecialchars($webdavConfig['username']) ?></p>
+                                                        <p class="text-muted small mb-1">用户: <?= htmlspecialchars($webdavConfig['username']) ?></p>
+                                                        <p class="text-muted small">路径: <?= htmlspecialchars($webdavConfig['base_path'] ?? '/') ?></p>
                                                     </div>
                                                     <div class="dropdown">
                                                         <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown">
@@ -395,6 +526,11 @@ if (isset($_GET['action'])) {
                             <label for="webdav_password" class="form-label">密码</label>
                             <input type="password" class="form-control" id="webdav_password" name="password" required>
                         </div>
+                        <div class="mb-3">
+                            <label for="webdav_base_path" class="form-label">基础路径</label>
+                            <input type="text" class="form-control" id="webdav_base_path" name="base_path" value="/" placeholder="/">
+                            <div class="form-text">文件存储的基础路径，例如: /uploads/ 或 /</div>
+                        </div>
                     </form>
                 </div>
                 <div class="modal-footer">
@@ -410,16 +546,19 @@ if (isset($_GET['action'])) {
         // 保存系统配置
         document.getElementById('saveConfigBtn').addEventListener('click', async function() {
             const form = document.getElementById('configForm');
-            const formData = new FormData(form);
             const data = {};
 
-            for (let [key, value] of formData.entries()) {
-                if (key === 'app_debug' || key === 'log_enabled') {
-                    data[key] = form.querySelector(`[name="${key}"]`).checked ? 'true' : 'false';
-                } else {
-                    data[key] = value;
-                }
-            }
+            // 处理普通输入字段
+            const inputs = form.querySelectorAll('input[type="text"], input[type="number"], textarea, select');
+            inputs.forEach(input => {
+                data[input.name] = input.value;
+            });
+
+            // 处理复选框
+            const checkboxes = form.querySelectorAll('input[type="checkbox"]');
+            checkboxes.forEach(checkbox => {
+                data[checkbox.name] = checkbox.checked ? 'true' : 'false';
+            });
 
             this.disabled = true;
             this.innerHTML = '<i class="bi bi-hourglass-split"></i> 保存中...';
@@ -501,6 +640,24 @@ if (isset($_GET['action'])) {
                     }
                 });
             });
+        }
+
+        // 测试认证功能（XREA环境调试用）
+        async function testAuth() {
+            try {
+                const response = await fetch('?action=test_auth');
+                const result = await response.json();
+
+                if (result.success) {
+                    alert('认证测试成功！\n\n调试信息：\n' + JSON.stringify(result.debug, null, 2));
+                } else {
+                    alert('认证测试失败：' + result.error + '\n\n调试信息：\n' + JSON.stringify(result.debug, null, 2));
+                }
+
+                console.log('认证测试结果:', result);
+            } catch (error) {
+                alert('请求失败: ' + error.message);
+            }
         }
 
         // 初始化事件绑定

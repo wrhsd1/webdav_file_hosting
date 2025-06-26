@@ -79,6 +79,16 @@ class Config
      */
     public function get($key, $default = null)
     {
+        // 对于某些关键配置，实时从环境变量读取
+        if (in_array($key, ['log_enabled', 'app_debug'])) {
+            if ($key === 'log_enabled') {
+                return filter_var($_ENV['LOG_ENABLED'] ?? true, FILTER_VALIDATE_BOOLEAN);
+            }
+            if ($key === 'app_debug') {
+                return filter_var($_ENV['APP_DEBUG'] ?? false, FILTER_VALIDATE_BOOLEAN);
+            }
+        }
+
         return $this->config[$key] ?? $default;
     }
 
